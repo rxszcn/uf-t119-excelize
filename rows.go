@@ -42,7 +42,11 @@ var duplicateHelperFunc = [3]func(*File, *xlsxWorksheet, string, int, int) error
 // the applied value will be used, otherwise the original value will be used.
 // GetRows fetched the rows with value or formula cells, the continually blank
 // cells in the tail of each row will be skipped, so the length of each row
-// may be inconsistent.
+// may be inconsistent. If the ExpandMergedCells option is set to true, all the
+// cells in a merged range will be filled with the anchor cell value, which
+// gives the visual representation of the worksheet. The default value of this
+// option is false, which keeps the current behavior: only the anchor cell of a
+// merged range holds the value.
 //
 // For example, get and traverse the value of all cells by rows on a worksheet
 // named 'Sheet1':
@@ -86,6 +90,11 @@ type Rows struct {
 	err                     error
 	curRow, seekRow         int
 	needClose, rawCellValue bool
+	rowReady                bool
+	expandMerged            bool
+	mergedCellRaw           bool
+	mergedCellLoaded        bool
+	mergedCellRanges        []mergedCellRange
 	sheet                   string
 	f                       *File
 	tempFile                *os.File
@@ -102,7 +111,7 @@ func (rows *Rows) Next() bool {
 	}
 	rows.seekRow++
 	if rows.curRow >= rows.seekRow {
-		rows.curRowOpts = rows.seekRowOpts
+		rows.rowReady, rows.curRowOpts = true, rows.seekRowOpts
 		return true
 	}
 	for {
@@ -122,7 +131,7 @@ func (rows *Rows) Next() bool {
 				if rowNum != 0 {
 					rows.curRow = rowNum
 				}
-				rows.token = token
+				rows.token, rows.rowReady = token, true
 				rows.curRowOpts = extractRowOpts(xmlElement.Attr)
 				return true
 			}
@@ -157,8 +166,209 @@ func (rows *Rows) Close() error {
 
 // Columns return the current row's column values. This fetches the worksheet
 // data as a stream, returns each cell in a row as is, and will not skip empty
-// rows in the tail of the worksheet.
+// rows in the tail of the worksheet. If the ExpandMergedCells option is set to
+// true, all the cells in a merged range covering the current row will be filled
+// with the anchor cell value, the anchor cell keeps the same value as the read
+// without this option. A merged range without an anchor value keeps all of its
+// cells blank. The row sequence of the iterator is not affected by this option,
+// so the rows after the last row of the worksheet are not expanded, the same as
+// the row reading itself.
 func (rows *Rows) Columns(opts ...Options) ([]string, error) {
+	// The row number of the current row must be captured before the row
+	// streaming reading, the reading advances the row state of the iterator.
+	// The iterator yields one row per iteration and the row number sequence
+	// keeps the same as the worksheet, which keeps the merged cell range aligned.
+	// A repeated call for an already read row returns no cell and will not
+	// expand the merged cell value again.
+	row, ready := rows.seekRow, rows.rowReady
+	rows.rowReady = false
+	options := rows.f.getOptions(opts...)
+	rows.expandMerged = options.ExpandMergedCells
+	if rows.expandMerged {
+		if rows.mergedCellRaw != options.RawCellValue {
+			rows.resetMergedCellRanges()
+			rows.mergedCellRaw = options.RawCellValue
+		}
+		if !rows.mergedCellLoaded {
+			if err := rows.loadMergedCellRanges(); err != nil {
+				return nil, err
+			}
+			rows.mergedCellLoaded = true
+		}
+	}
+	cells, err := rows.columns(opts...)
+	if err != nil || !rows.expandMerged || !ready {
+		return cells, err
+	}
+	// The merged cell range of the current row is expanded by the row number of
+	// the current row. A row absent from the worksheet XML is yielded as a
+	// blank row by the iteration, so the merged range covering it is expanded
+	// by the iteration row number.
+	return rows.expandMergedCellValues(row, cells), nil
+}
+
+// mergedCellRange defines a merged cell range used for expanding the anchor
+// cell value to the other cells in the range while reading rows.
+type mergedCellRange struct {
+	rect  []int
+	col   int
+	row   int
+	value string
+}
+
+// resetMergedCellRanges clears the cached merged cell ranges, it will be
+// called when the option which affects the anchor cell value has changed.
+func (rows *Rows) resetMergedCellRanges() {
+	rows.mergedCellRanges = nil
+	rows.mergedCellLoaded = false
+}
+
+// loadMergedCellRanges loads the merged cell ranges of the worksheet and
+// resolves the anchor cell value of each range. The merged cell ranges are
+// kept in the worksheet declaration order, which keeps the same precedence as
+// the merged cell value parser: the first merged range containing a cell takes
+// effect for that cell.
+func (rows *Rows) loadMergedCellRanges() error {
+	ranges, err := rows.f.worksheetMergeRects(rows.sheet)
+	if err != nil {
+		return err
+	}
+	rows.mergedCellRanges = make([]mergedCellRange, 0, len(ranges))
+	for _, r := range ranges {
+		rows.mergedCellRanges = append(rows.mergedCellRanges, mergedCellRange{rect: r.rect, col: r.anchorCol, row: r.anchorRow})
+	}
+	if len(rows.mergedCellRanges) == 0 {
+		return nil
+	}
+	if rows.sst, err = rows.f.sharedStringsReader(); err != nil {
+		return err
+	}
+	return rows.resolveMergedCellAnchors()
+}
+
+// resolveMergedCellAnchors reads the anchor cell value of each merged cell
+// range by the same value conversion path as the row streaming reading, so
+// that the expanded value is identical to the anchor cell reading.
+func (rows *Rows) resolveMergedCellAnchors() error {
+	var (
+		anchors  = make(map[[2]int][]int, len(rows.mergedCellRanges))
+		maxRow   int
+		remained = len(rows.mergedCellRanges)
+	)
+	for i := range rows.mergedCellRanges {
+		key := [2]int{rows.mergedCellRanges[i].col, rows.mergedCellRanges[i].row}
+		anchors[key] = append(anchors[key], i)
+		// The merged cell range reference may be declared in the reversed
+		// order, the anchor cell is the first cell reference which may not be
+		// the top-left cell of the range, so the scan boundary is the maximum
+		// anchor row instead of the top row of the range.
+		maxRow = max(maxRow, rows.mergedCellRanges[i].row)
+	}
+	needClose, decoder, tempFile, err := rows.f.xmlDecoder(rows.sheet)
+	if err != nil {
+		return err
+	}
+	if needClose && tempFile != nil {
+		defer func() { _ = tempFile.Close() }()
+	}
+	var rowNum, cellCol int
+	for remained > 0 {
+		token, err := decoder.Token()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		xmlElement, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch xmlElement.Name.Local {
+		case "row":
+			cellCol = 0
+			rowNum++
+			if num, err := attrValToInt("r", xmlElement.Attr); err == nil && num != 0 {
+				rowNum = num
+			}
+			if rowNum > maxRow {
+				return nil
+			}
+		case "c":
+			cellCol++
+			colCell := xlsxC{}
+			_ = colCell.cellXMLAttrHandler(&xmlElement)
+			if colCell.R != "" {
+				if cellCol, _, err = CellNameToCoordinates(colCell.R); err != nil {
+					return err
+				}
+			}
+			indexes, ok := anchors[[2]int{cellCol, rowNum}]
+			if !ok {
+				if err = decoder.Skip(); err != nil {
+					return err
+				}
+				continue
+			}
+			if err = colCell.cellXMLHandler(decoder, &xmlElement); err != nil {
+				return err
+			}
+			val, _ := colCell.getValueFrom(rows.f, rows.sst, rows.mergedCellRaw)
+			for _, idx := range indexes {
+				rows.mergedCellRanges[idx].value = val
+			}
+			remained -= len(indexes)
+		}
+	}
+	return nil
+}
+
+// expandMergedCellValues fills the cells in the merged ranges of the current
+// row with the anchor cell value. The anchor cell value has been evaluated by
+// the same conversion path as the row reading, the anchor cell itself keeps
+// the same value. A merged range without an anchor value keeps all of its
+// cells blank and will not extend the row. If several merged ranges cover the
+// same cell, the first merged range in the worksheet takes precedence, which
+// keeps the same semantic as the merged cell value parser.
+func (rows *Rows) expandMergedCellValues(row int, cells []string) []string {
+	if len(rows.mergedCellRanges) == 0 || row < 1 {
+		return cells
+	}
+	values := make(map[int]string)
+	for i := range rows.mergedCellRanges {
+		mergedCell := &rows.mergedCellRanges[i]
+		rect := mergedCell.rect
+		if row < rect[1] || row > rect[3] {
+			continue
+		}
+		for col := rect[0]; col <= rect[2]; col++ {
+			if _, decided := values[col]; decided {
+				continue
+			}
+			values[col] = mergedCell.value
+		}
+	}
+	for col, val := range values {
+		if val == "" {
+			// Keep the same semantic as the in-memory reading: a merged range
+			// without an anchor value reads blank in all of its cells, and it
+			// will not extend the row.
+			if len(cells) >= col {
+				cells[col-1] = ""
+			}
+			continue
+		}
+		if len(cells) < col {
+			cells = append(cells, make([]string, col-len(cells))...)
+		}
+		cells[col-1] = val
+	}
+	return cells
+}
+
+// columns return the current row's column values, it is the streaming worker
+// of the Columns method without handling the merged cell value expansion.
+func (rows *Rows) columns(opts ...Options) ([]string, error) {
 	if rows.curRow > rows.seekRow {
 		return nil, nil
 	}

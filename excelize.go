@@ -111,10 +111,19 @@ type ZipWriter interface {
 //
 // CultureInfo specifies the country code for applying built-in language number
 // format code these effect by the system's local language settings.
+//
+// ExpandMergedCells specifies if fill all the cells in a merged range with the
+// anchor cell value when reading rows by the GetRows function or the Columns
+// method of the Rows iterator. The default value is false which keeps the
+// current behavior: only the anchor cell of a merged range holds the value and
+// the other cells in the range are blank. The anchor cell value is formatted in
+// the same way as the read without this option, and a merged range without an
+// anchor value keeps all of its cells blank.
 type Options struct {
 	MaxCalcIterations uint
 	Password          string
 	RawCellValue      bool
+	ExpandMergedCells bool
 	UnzipSizeLimit    int64
 	UnzipXMLSizeLimit int64
 	TmpDir            string

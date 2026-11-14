@@ -11,7 +11,11 @@
 
 package excelize
 
-import "strings"
+import (
+	"encoding/xml"
+	"io"
+	"strings"
+)
 
 // Rect gets merged cell rectangle coordinates sequence.
 func (mc *xlsxMergeCell) Rect() ([]int, error) {
@@ -170,6 +174,96 @@ func (f *File) GetMergeCells(sheet string, withoutValues ...bool) ([]MergeCell, 
 		}
 	}
 	return mergeCells, err
+}
+
+// mergeRefToRect provides a function to parse a merged cell range reference
+// to the sorted coordinates rectangle, a single cell reference will be treated
+// as a one cell range.
+func mergeRefToRect(ref string) ([]int, error) {
+	ref = strings.ToUpper(strings.TrimSpace(ref))
+	if ref == "" {
+		return nil, ErrParameterInvalid
+	}
+	if !strings.Contains(ref, ":") {
+		ref += ":" + ref
+	}
+	rect, err := rangeRefToCoordinates(ref)
+	if err != nil {
+		return nil, err
+	}
+	return rect, sortCoordinates(rect)
+}
+
+// mergeRange defines a merged cell range used for expanding the anchor cell
+// value to the other cells in the range. The rect is the sorted rectangle of
+// the range, the anchor cell is the first cell reference in the range
+// reference which may not be the top-left cell of the range, which keeps the
+// same semantic as the merged cell value parser.
+type mergeRange struct {
+	rect      []int
+	anchorCol int
+	anchorRow int
+}
+
+// worksheetMergeRects provides a function to read the merged cell ranges of a
+// worksheet from its XML data without loading the whole worksheet into memory.
+// The returned ranges keep the worksheet order, the malformed range reference
+// will be ignored, which keeps the row reading available with a broken merged
+// cell range.
+func (f *File) worksheetMergeRects(name string) ([]mergeRange, error) {
+	needClose, decoder, tempFile, err := f.xmlDecoder(name)
+	if err != nil {
+		return nil, err
+	}
+	if needClose && tempFile != nil {
+		defer func() { _ = tempFile.Close() }()
+	}
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			if err == io.EOF {
+				return nil, nil
+			}
+			return nil, err
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if start.Name.Local == "sheetData" {
+			// The mergeCells element is declared after the sheetData element in
+			// the worksheet, skip the cell data to find the merged cell ranges
+			// without parsing it.
+			if err = decoder.Skip(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if start.Name.Local != "mergeCells" {
+			continue
+		}
+		var cells xlsxMergeCells
+		if err = decoder.DecodeElement(&cells, &start); err != nil {
+			return nil, err
+		}
+		ranges := make([]mergeRange, 0, len(cells.Cells))
+		for _, cell := range cells.Cells {
+			if cell == nil {
+				continue
+			}
+			rect, err := mergeRefToRect(cell.Ref)
+			if err != nil {
+				continue
+			}
+			anchor := strings.Split(strings.ToUpper(strings.TrimSpace(cell.Ref)), ":")[0]
+			anchorCol, anchorRow, err := CellNameToCoordinates(anchor)
+			if err != nil {
+				continue
+			}
+			ranges = append(ranges, mergeRange{rect: rect, anchorCol: anchorCol, anchorRow: anchorRow})
+		}
+		return ranges, nil
+	}
 }
 
 // mergeOverlapCells merge overlap cells.
